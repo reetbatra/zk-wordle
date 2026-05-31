@@ -1,0 +1,71 @@
+{
+  "compiler-version": "0.30.0",
+  "language-version": "0.22.0",
+  "runtime-version": "0.15.0",
+  "circuits": [
+    {
+      "name": "newGame",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+      ],
+      "result-type": {
+        "type-name": "Tuple",
+        "types": [
+        ]
+      }
+    },
+    {
+      "name": "submitGuess",
+      "pure": false,
+      "proof": true,
+      "arguments": [
+        {
+          "name": "guess",
+          "type": {
+            "type-name": "Vector",
+            "length": 5,
+            "type": {
+              "type-name": "Uint",
+              "maxval": 255
+            }
+          }
+        }
+      ],
+      "result-type": {
+        "type-name": "Vector",
+        "length": 5,
+        "type": {
+          "type-name": "Uint",
+          "maxval": 255
+        }
+      }
+    }
+  ],
+  "witnesses": [
+    {
+      "name": "localSecretWord",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Vector",
+        "length": 5,
+        "type": {
+          "type-name": "Uint",
+          "maxval": 255
+        }
+      }
+    },
+    {
+      "name": "localSalt",
+      "arguments": [
+      ],
+      "result type": {
+        "type-name": "Bytes",
+        "length": 32
+      }
+    }
+  ],
+  "contracts": [
+  ]
+}

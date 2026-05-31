@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// zk-Wordle on Midnight
+// =====================
+//
+// PUBLIC ledger state: a hash-commitment to the secret word, the
+// list of submitted guesses, and the per-guess clue (greens/yellows/grays).
+//
+// PRIVATE state (witnesses): the secret word and the salt used in the
+// commitment. Only the host (whose TS driver implements the witnesses)
+// can produce a valid proof for `submitGuess`.
+//
+// Each guess transaction proves: "given a secret 5-letter word that
+// hashes to the published commitment, the published clue is the correct
+// Wordle feedback for the player's guess." Neither word nor salt is
+// revealed on chain.
+
+pragma language_version >= 0.20;
+
+import CompactStandardLibrary;
+
+export enum GameStatus {
+  Empty,    // contract deployed, no word committed yet
+  Playing,  // active game
+  Won,      // player guessed correctly
+  Lost      // player exhausted all attempts
+}
+
+// =====================================================================
+// Public ledger state
+// =====================================================================
+export ledger commitment: Bytes<32>;
+export ledger status: GameStatus;
+export ledger attempts: Counter;
+export ledger guesses: Map<Uint<8>, Vector<5, Uint<8>>>;
+export ledger clues: Map<Uint<8>, Vector<5, Uint<8>>>;
+
+// =====================================================================
+// Private witnesses (provided by the host's TS driver)
+// =====================================================================
+witness localSecretWord(): Vector<5, Uint<8>>;
+witness localSalt(): Bytes<32>;
+
+// =====================================================================
+// Helper: bind word + salt into a single hashable struct
+// =====================================================================
+struct Commitment {
+  word: Vector<5, Uint<8>>;
+  salt: Bytes<32>;
+}
+
+// =====================================================================
+// Host commits to a secret word. One-shot per contract instance.
+// Anyone can call this, but only the host's TS driver supplies a
+// witness, so only the host can actually produce a valid proof.
+// =====================================================================
+export circuit newGame(): [] {
+  assert(status == GameStatus.Empty, "Game already started.");
+  const word = localSecretWord();
+  const salt = localSalt();
+  const c = persistentHash<Commitment>(Commitment { word: word, salt: salt });
+  commitment = disclose(c);
+  status = GameStatus.Playing;
+}
+
+// =====================================================================
+// Player submits a guess.
+//
+// The circuit:
+//   1. Recovers the secret word + salt via witnesses.
+//   2. Re-hashes them and asserts equality with the published commitment
+//      (this binds the host to the word they originally committed to).
+//   3. Computes the standard Wordle clue.
+//   4. Appends guess + clue to public history.
+//   5. Advances Won / Lost / Playing.
+// =====================================================================
+export circuit submitGuess(guess: Vector<5, Uint<8>>): Vector<5, Uint<8>> {
+  assert(status == GameStatus.Playing, "Game is not in progress.");
+
+  const solution = localSecretWord();
+  const salt = localSalt();
+  const expected = persistentHash<Commitment>(
+    Commitment { word: solution, salt: salt }
+  );
+  assert(expected == commitment, "Witness does not match committed word.");
+
+  // The clue is computed from a witness, so we disclose it once
+  // here — that's exactly the privacy boundary: the clue is public
+  // Wordle feedback, the underlying word stays private.
+  const clue = disclose(computeClue(guess, solution));
+
+  const idx = attempts.read() as Uint<8>;
+  guesses.insert(idx, disclose(guess));
+  clues.insert(idx, clue);
+  attempts.increment(1);
+
+  // Win = all greens. `clue` is already disclosed, so this is fine.
+  const won = clue[0] == 1 && clue[1] == 1 && clue[2] == 1
+           && clue[3] == 1 && clue[4] == 1;
+
+  if (won) {
+    status = GameStatus.Won;
+  } else if (attempts.read() >= 6) {
+    status = GameStatus.Lost;
+  }
+
+  return clue;
+}
+
+// =====================================================================
+// consumeOne: inner helper for clue computation.
+//
+// Given a single guess letter `g` (with its `isCorrect` green flag
+// already known) and the running `taken` mask of solution slots that
+// have been "used up" by earlier greens or yellows, find the leftmost
+// solution slot that this guess letter can claim as a yellow.
+//
+// Returns: the updated taken mask, and whether this position got a yellow.
+// =====================================================================
+pure circuit consumeOne(
+  g: Uint<8>,
+  isCorrect: Boolean,
+  solution: Vector<5, Uint<8>>,
+  taken: Vector<5, Boolean>
+): [Vector<5, Boolean>, Boolean] {
+  const m0 = !isCorrect && !taken[0] && g == solution[0];
+  const m1 = !isCorrect && !m0 && !taken[1] && g == solution[1];
+  const m2 = !isCorrect && !m0 && !m1 && !taken[2] && g == solution[2];
+  const m3 = !isCorrect && !m0 && !m1 && !m2 && !taken[3] && g == solution[3];
+  const m4 = !isCorrect && !m0 && !m1 && !m2 && !m3 && !taken[4] && g == solution[4];
+
+  const newTaken: Vector<5, Boolean> = [
+    taken[0] || m0,
+    taken[1] || m1,
+    taken[2] || m2,
+    taken[3] || m3,
+    taken[4] || m4
+  ];
+
+  return [newTaken, m0 || m1 || m2 || m3 || m4];
+}
+
+// =====================================================================
+// computeClue: standard Wordle feedback.
+//   1 = green  (right letter, right position)
+//   2 = yellow (letter present elsewhere, not yet matched)
+//   0 = gray   (absent or already matched)
+//
+// Repeated letters are handled by tracking which solution slots have
+// already been consumed. Compact has no mutable locals, so the running
+// state is threaded through chained const bindings.
+// =====================================================================
+pure circuit computeClue(
+  guess: Vector<5, Uint<8>>,
+  solution: Vector<5, Uint<8>>
+): Vector<5, Uint<8>> {
+  const correct: Vector<5, Boolean> = [
+    guess[0] == solution[0],
+    guess[1] == solution[1],
+    guess[2] == solution[2],
+    guess[3] == solution[3],
+    guess[4] == solution[4]
+  ];
+
+  // Greens consume their own slot first.
+  const taken0: Vector<5, Boolean> = correct;
+
+  const r0 = consumeOne(guess[0], correct[0], solution, taken0);
+  const r1 = consumeOne(guess[1], correct[1], solution, r0[0]);
+  const r2 = consumeOne(guess[2], correct[2], solution, r1[0]);
+  const r3 = consumeOne(guess[3], correct[3], solution, r2[0]);
+  const r4 = consumeOne(guess[4], correct[4], solution, r3[0]);
+
+  const y0 = r0[1];
+  const y1 = r1[1];
+  const y2 = r2[1];
+  const y3 = r3[1];
+  const y4 = r4[1];
+
+  return [
+    correct[0] ? 1 as Uint<8> : (y0 ? 2 as Uint<8> : 0 as Uint<8>),
+    correct[1] ? 1 as Uint<8> : (y1 ? 2 as Uint<8> : 0 as Uint<8>),
+    correct[2] ? 1 as Uint<8> : (y2 ? 2 as Uint<8> : 0 as Uint<8>),
+    correct[3] ? 1 as Uint<8> : (y3 ? 2 as Uint<8> : 0 as Uint<8>),
+    correct[4] ? 1 as Uint<8> : (y4 ? 2 as Uint<8> : 0 as Uint<8>)
+  ];
+}

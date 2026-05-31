@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.log
+logs/
+.env
+.env.local
+.DS_Store
+
+# Local wallet/indexer/private-state caches written by midnight-js
+.midnight/
+*-state-*/
+*-private-state*/
+
