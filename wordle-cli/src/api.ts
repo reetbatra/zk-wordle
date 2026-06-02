@@ -27,11 +27,11 @@ import { HDWallet, Roles, generateRandomSeed } from '@midnight-ntwrk/wallet-sdk-
 import { ShieldedWallet } from '@midnight-ntwrk/wallet-sdk-shielded';
 import {
   createKeystore,
-  InMemoryTransactionHistoryStorage,
   PublicKey,
   UnshieldedWallet,
   type UnshieldedKeystore,
 } from '@midnight-ntwrk/wallet-sdk-unshielded-wallet';
+import { NoOpTransactionHistoryStorage } from '@midnight-ntwrk/wallet-sdk-abstractions';
 import {
   MidnightBech32m,
   ShieldedAddress,
@@ -45,6 +45,13 @@ import { Buffer } from 'buffer';
 import { type WordleProviders, type DeployedWordleContract, WordlePrivateStateId } from './common-types.js';
 import { type Config, contractConfig } from './config.js';
 import { seedBytesFromInput, resolveDerivation } from './seed.js';
+import {
+  walletStatePath,
+  loadWalletState,
+  saveWalletState,
+  clearWalletState,
+  type WalletStateSnapshot,
+} from './wallet-state.js';
 
 let logger: Logger;
 
@@ -264,7 +271,7 @@ const buildShieldedConfig = ({ indexer, indexerWS, node, proofServer }: Config) 
 const buildUnshieldedConfig = ({ indexer, indexerWS }: Config) => ({
   networkId: getNetworkId(),
   indexerClientConnection: { indexerHttpUrl: indexer, indexerWsUrl: indexerWS },
-  txHistoryStorage: new InMemoryTransactionHistoryStorage(),
+  txHistoryStorage: new NoOpTransactionHistoryStorage(),
 });
 
 const buildDustConfig = ({ indexer, indexerWS, node, proofServer }: Config) => ({
@@ -394,34 +401,93 @@ ${DIV}
 ${DIV}`);
 };
 
-/** Build (or restore) a wallet from a hex seed and wait for sync + funds. */
+/** Initialize the facade, restoring any component that has a saved checkpoint. */
+const initFacade = async (
+  config: Config,
+  shieldedSecretKeys: ledger.ZswapSecretKeys,
+  dustSecretKey: ledger.DustSecretKey,
+  unshieldedKeystore: UnshieldedKeystore,
+  saved: WalletStateSnapshot | null,
+): Promise<WalletFacade> => {
+  const walletConfig = {
+    ...buildShieldedConfig(config),
+    ...buildUnshieldedConfig(config),
+    ...buildDustConfig(config),
+  };
+  const wallet = await WalletFacade.init({
+    configuration: walletConfig,
+    shielded: (cfg) =>
+      saved?.shielded ? ShieldedWallet(cfg).restore(saved.shielded) : ShieldedWallet(cfg).startWithSecretKeys(shieldedSecretKeys),
+    unshielded: (cfg) =>
+      saved?.unshielded
+        ? UnshieldedWallet(cfg).restore(saved.unshielded)
+        : UnshieldedWallet(cfg).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
+    dust: (cfg) =>
+      saved?.dust
+        ? DustWallet(cfg).restore(saved.dust)
+        : DustWallet(cfg).startWithSecretKey(dustSecretKey, ledger.LedgerParameters.initialParameters().dust),
+  });
+  await wallet.start(shieldedSecretKeys, dustSecretKey);
+  return wallet;
+};
+
+/** Snapshot each component's serialized state from a facade state. */
+const snapshotFrom = (s: any): WalletStateSnapshot => ({
+  shielded: s?.shielded?.serialize?.(),
+  unshielded: s?.unshielded?.serialize?.(),
+  dust: s?.dust?.serialize?.(),
+  savedAt: new Date().toISOString(),
+});
+
+/**
+ * Checkpoint wallet state to disk (throttled) for the duration of the session,
+ * printing sync progress. Makes the slow first sync resumable across restarts
+ * and lets later runs restore instead of re-syncing from index 0.
+ */
+const startCheckpointing = (wallet: WalletFacade, stateFile: string): Rx.Subscription =>
+  wallet
+    .state()
+    .pipe(Rx.throttleTime(30_000, undefined, { leading: false, trailing: true }))
+    .subscribe((s: any) => {
+      try {
+        saveWalletState(stateFile, snapshotFrom(s));
+        const pct = (a: any, t: any) => (t && Number(t) > 0 ? `${((Number(a) / Number(t)) * 100).toFixed(1)}%` : '—');
+        const dp = s?.dust?.progress ?? {};
+        const sp = s?.shielded?.progress ?? {};
+        process.stdout.write(
+          `\r  ⟳ sync — dust ${pct(dp.appliedIndex, dp.highestRelevantWalletIndex)} ` +
+            `(${dp.appliedIndex}/${dp.highestRelevantWalletIndex}), shielded ${pct(sp.appliedIndex, sp.highestRelevantWalletIndex)}, ` +
+            `synced=${s?.isSynced}      \n`,
+        );
+      } catch {
+        /* checkpoint is best-effort */
+      }
+    });
+
+/** Build (or restore) a wallet from a seed/recovery phrase and wait for sync + funds. */
 export const buildWalletAndWaitForFunds = async (config: Config, seed: string): Promise<WalletContext> => {
   console.log('');
 
-  const { wallet, shieldedSecretKeys, dustSecretKey, unshieldedKeystore } = await withStatus(
-    'Building wallet',
-    async () => {
-      const keys = deriveKeysFromSeed(seed);
-      const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys[Roles.Zswap]);
-      const dustSecretKey = ledger.DustSecretKey.fromSeed(keys[Roles.Dust]);
-      const unshieldedKeystore = createKeystore(keys[Roles.NightExternal], getNetworkId());
+  const keys = deriveKeysFromSeed(seed);
+  const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys[Roles.Zswap]);
+  const dustSecretKey = ledger.DustSecretKey.fromSeed(keys[Roles.Dust]);
+  const unshieldedKeystore = createKeystore(keys[Roles.NightExternal], getNetworkId());
+  const address = String(unshieldedKeystore.getBech32Address());
+  const stateFile = walletStatePath(config.networkId, address);
+  const saved = loadWalletState(stateFile);
 
-      const walletConfig = {
-        ...buildShieldedConfig(config),
-        ...buildUnshieldedConfig(config),
-        ...buildDustConfig(config),
-      };
-      const wallet = await WalletFacade.init({
-        configuration: walletConfig,
-        shielded: (cfg) => ShieldedWallet(cfg).startWithSecretKeys(shieldedSecretKeys),
-        unshielded: (cfg) => UnshieldedWallet(cfg).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
-        dust: (cfg) => DustWallet(cfg).startWithSecretKey(dustSecretKey, ledger.LedgerParameters.initialParameters().dust),
-      });
-      await wallet.start(shieldedSecretKeys, dustSecretKey);
-
-      return { wallet, shieldedSecretKeys, dustSecretKey, unshieldedKeystore };
-    },
-  );
+  const wallet = await withStatus(saved ? 'Restoring saved wallet state' : 'Building wallet', async () => {
+    try {
+      return await initFacade(config, shieldedSecretKeys, dustSecretKey, unshieldedKeystore, saved);
+    } catch (e) {
+      if (saved) {
+        // Corrupt or incompatible checkpoint — discard it and start fresh.
+        clearWalletState(stateFile);
+        return await initFacade(config, shieldedSecretKeys, dustSecretKey, unshieldedKeystore, null);
+      }
+      throw e;
+    }
+  });
 
   const networkId = getNetworkId();
   const DIV = '──────────────────────────────────────────────────────────────';
@@ -430,15 +496,27 @@ ${DIV}
   Wallet Overview                            Network: ${networkId}
 ${DIV}
   Unshielded Address (send tNight here):
-  ${unshieldedKeystore.getBech32Address()}
+  ${address}
 
   Confirm this matches the address shown in your 1AM wallet. Fund it with
   tNight from the Preprod faucet if needed:
   https://faucet.preprod.midnight.network/
 ${DIV}
 `);
+  if (saved) {
+    console.log(`  Resuming from checkpoint saved ${saved.savedAt} — syncing only the delta.\n`);
+  } else {
+    console.log('  First sync of this wallet can take a while (full history). Progress is\n  checkpointed every ~30s, so it resumes if interrupted.\n');
+  }
 
+  const checkpoint = startCheckpointing(wallet, stateFile);
   const syncedState = await withStatus('Syncing with network', () => waitForSync(wallet));
+  // Persist the fully-synced state so future runs start instantly.
+  try {
+    saveWalletState(stateFile, snapshotFrom(syncedState));
+  } catch {
+    /* best-effort */
+  }
   printWalletSummary(syncedState, unshieldedKeystore);
 
   const balance = syncedState.unshielded.balances[unshieldedToken().raw] ?? 0n;
@@ -448,6 +526,10 @@ ${DIV}
   }
 
   await registerForDustGeneration(wallet, unshieldedKeystore);
+
+  // Keep checkpointing through the session so resumes stay fast; the process
+  // exits shortly after, which tears the subscription down.
+  void checkpoint;
 
   return { wallet, shieldedSecretKeys, dustSecretKey, unshieldedKeystore };
 };

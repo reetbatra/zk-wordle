@@ -2,6 +2,20 @@
 
 A privacy-preserving Wordle game built on Midnight using zero-knowledge proofs. The secret word is committed as a hash on-chain, and every clue is a ZK proof — the word itself is never revealed.
 
+## Live on preprod
+
+This has run end-to-end on Midnight's **preprod testnet** with real ZK proofs — not just locally.
+
+- **Deployed contract:** `f94103ebdebdd47f4168e6a8e12f7503352a4289718166de0a4880568bbc1409`
+- A secret word (`CRANE`) was committed, three guesses (`SLATE → REACT → CRANE`) were each submitted with a **real ZK proof** through a local proof server, and **every on-chain clue was verified** against an independent reference implementation of the Wordle rule. Game won in 3 — status `Won`, confirmed on chain.
+
+Reproduce it yourself (non-interactive):
+
+```bash
+npm run sync   # one-time wallet sync (resumable; see "First sync" below)
+npm run e2e    # deploy a fresh contract + submit 3 real ZK proofs, verifying each on-chain clue
+```
+
 ## How It Works
 
 1. **Host picks a secret word** locally and generates a random salt
@@ -19,13 +33,20 @@ zk-wordle/
 │       ├── wordle.compact       # ZK circuit definition
 │       ├── witnesses.ts         # TS witness implementations (secret word + salt)
 │       └── managed/             # Generated TS contract bindings
-└── wordle-cli/         # CLI game interface
-    └── src/
-        ├── preprod.ts           # Entry point
-        ├── game.ts              # Game loop and UI
-        ├── api.ts               # Wallet, providers, contract operations
-        ├── config.ts            # Configuration
-        └── words.ts             # Word list (50 5-letter words)
+├── wordle-cli/         # CLI game interface
+│   └── src/
+│       ├── preprod.ts           # Interactive game entry point
+│       ├── game.ts              # Game loop and UI
+│       ├── api.ts               # Wallet, providers, contract operations
+│       ├── wallet-state.ts      # Resumable wallet-state checkpoint/restore
+│       ├── e2e.ts               # Non-interactive end-to-end test (real ZK proofs)
+│       ├── deploy.ts            # Deploy a contract non-interactively
+│       ├── address.ts           # Print wallet addresses without syncing
+│       ├── seed.ts              # Hex-seed / BIP39 recovery-phrase key derivation
+│       ├── config.ts            # Configuration
+│       └── words.ts             # Word list (50 5-letter words)
+└── scripts/
+    └── sync-until-synced.sh     # Drives the one-time first sync to completion
 ```
 
 ## Prerequisites
@@ -64,6 +85,19 @@ cp .env.example .env
 - The CLI prints your unshielded address on first run
 - Get tNight from the faucet: https://faucet.preprod.midnight.network/
 
+6. Run the one-time wallet sync:
+```bash
+npm run sync
+```
+
+## First sync
+
+A brand-new wallet has to replay the chain's whole history to compute its balances. On preprod the **dust** wallet alone is ~900k events, and its per-batch rate decays as memory grows — so a single naive sync crawls for hours.
+
+`npm run sync` solves this: the wallet checkpoints its serialized state to `.midnight/` (gitignored) every ~30s, and the driver runs the sync in short bursts, **restarting to reset memory and resume from the last checkpoint**. This keeps the sync rate high and completes the one-time first sync in a series of bursts (~20–30 min). After that, every `npm run play` / `e2e` / `deploy` **restores from the checkpoint and starts in seconds** — only the small delta since last run is synced.
+
+If a sync is interrupted, just run `npm run sync` again; it resumes where it left off.
+
 ## Usage
 
 ### Build the project:
@@ -75,6 +109,13 @@ npm run build
 ```bash
 npm run play
 ```
+
+### Non-interactive end-to-end (real ZK proofs):
+```bash
+npm run e2e    # deploys a fresh contract, commits a word, submits 3 real ZK
+               # proofs, and asserts each on-chain clue matches the reference rule
+```
+Configurable via `E2E_WORD` and `E2E_GUESSES` (e.g. `E2E_WORD=crane E2E_GUESSES=slate,react,crane`).
 
 ### Game options:
 1. **Start a new game** — Pick a random word, deploy contract, commit hash
